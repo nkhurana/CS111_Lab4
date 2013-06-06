@@ -167,14 +167,31 @@ typedef enum taskbufresult {		// Status of a read or write attempt.
 //	The task buffer is capped at TASKBUFSIZ.
 taskbufresult_t read_to_taskbuf(int fd, task_t *t)
 {
-	unsigned headpos = (t->head % (TASKBUFSIZ+t->additionalBufferSpace));
-	unsigned tailpos = (t->tail % (TASKBUFSIZ+t->additionalBufferSpace));
+	unsigned headpos;
+	unsigned tailpos;
 	ssize_t amt;
-    
-	if (t->head == t->tail || headpos < tailpos)
-		amt = read(fd, &t->buf[tailpos], (TASKBUFSIZ+t->additionalBufferSpace) - tailpos);
+	if (t->additionalBufferSpace)
+	{
+		headpos = (t->head);
+		tailpos = (t->tail);
+	}
 	else
+	{
+		headpos = (t->head % TASKBUFSIZ);
+		tailpos = (t->tail % TASKBUFSIZ);
+	}
+    error("THEAD %d HEADPOS %d\n", t->head, headpos);
+	error("TTAIL %d TAILPOS %d\n", t->tail, tailpos);
+	error("ADD BSPACE %d\n", t->additionalBufferSpace);
+	
+	if (t->head == t->tail || headpos < tailpos)
+	{
+		amt = read(fd, &t->buf[tailpos], (TASKBUFSIZ + t->additionalBufferSpace) - tailpos);
+	}
+	else
+	{
 		amt = read(fd, &t->buf[tailpos], headpos - tailpos);
+	}
     
 	if (amt == -1 && (errno == EINTR || errno == EAGAIN
                       || errno == EWOULDBLOCK))
@@ -319,16 +336,20 @@ static size_t read_tracker_response(task_t *t)
 
 		// If not, read more data.  Note that the read will not block
 		// unless NO data is available.
+		error ("Read error\n");
 		int ret = read_to_taskbuf(t->peer_fd, t);//push data from fd to t->buf
 		if (ret == TBUF_ERROR)
 			die("tracker read error");
 		else if (ret == TBUF_END)
         {
+			error("Increasing buffer space\n");
             t->additionalBufferSpace+=TASKBUFSIZ;
             t->buf = (char*)realloc(t->buf, (TASKBUFSIZ+t->additionalBufferSpace)*sizeof(char));
             //die("tracker connection closed prematurely!\n");
         }
+		error("Ending while\n");
 	}
+	error("Done reading response\n");
 }
 
 
@@ -711,9 +732,28 @@ static void task_upload(task_t *t)
 	}
 	t->head = t->tail = 0;
     
-    
-    
     //Make SURE can't open file in another directory!
+	char requested_dir[PATH_MAX];
+	char current_working_dir[PATH_MAX];
+	
+	if (!realpath(t->filename, requested_dir))
+	{
+		error("Unable to resolve requested file: %s", strerror(errno));
+		goto exit;
+	}
+	
+	if (!getcwd(current_working_dir, PATH_MAX))
+	{
+		error("Failed to find current working directory: %s", strerror(errno));
+		goto exit;
+	}
+	
+	if (!strcmp(requested_dir, current_working_dir))
+	{
+		error("Peer requesting a file not in the current directory!");
+		goto exit;
+	}
+	
 	t->disk_fd = open(t->filename, O_RDONLY);
 	if (t->disk_fd == -1) {
 		error("* Cannot open file %s", t->filename);
