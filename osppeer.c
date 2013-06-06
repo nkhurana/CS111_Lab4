@@ -169,12 +169,12 @@ typedef enum taskbufresult {		// Status of a read or write attempt.
 //	The task buffer is capped at TASKBUFSIZ.
 taskbufresult_t read_to_taskbuf(int fd, task_t *t)
 {
-	unsigned headpos = (t->head % (TASKBUFSIZ+t->additionalBufferSpace));
-	unsigned tailpos = (t->tail % (TASKBUFSIZ+t->additionalBufferSpace));
+	unsigned headpos = (t->head % TASKBUFSIZ);
+	unsigned tailpos = (t->tail % TASKBUFSIZ);
 	ssize_t amt;
     
 	if (t->head == t->tail || headpos < tailpos)
-		amt = read(fd, &t->buf[tailpos], (TASKBUFSIZ+t->additionalBufferSpace) - tailpos);
+		amt = read(fd, &t->buf[tailpos], TASKBUFSIZ - tailpos);
 	else
 		amt = read(fd, &t->buf[tailpos], headpos - tailpos);
     
@@ -187,7 +187,6 @@ taskbufresult_t read_to_taskbuf(int fd, task_t *t)
 		return TBUF_END;
 	else {
 		t->tail += amt;
-        //message("tail here: %i\n", t->tail);
 		return TBUF_OK;
 	}
 }
@@ -300,45 +299,33 @@ static size_t read_tracker_response(task_t *t)
 	char *s;
 	size_t split_pos = (size_t) -1, pos = 0;
 	t->head = t->tail = 0;
-
-	while (1) 
-    {
+    
+	while (1) {
 		// Check for whether buffer is complete.
-		//message("and tail: %i\n", t->tail);
-        //message("pos: %i\n", pos);
-        for (; pos+3 < t->tail; pos++)
+		for (; pos+3 < t->tail; pos++)
 			if ((pos == 0 || t->buf[pos-1] == '\n')
 			    && isdigit((unsigned char) t->buf[pos])
 			    && isdigit((unsigned char) t->buf[pos+1])
-			    && isdigit((unsigned char) t->buf[pos+2])) 
-            {
+			    && isdigit((unsigned char) t->buf[pos+2])) {
 				if (split_pos == (size_t) -1)
 					split_pos = pos;
-                //if (t->tail>8000)
-                    //message("tail: %i\n", t->tail);
 				if (pos + 4 >= t->tail)
 					break;
 				if (isspace((unsigned char) t->buf[pos + 3])
-				    && t->buf[t->tail - 1] == '\n') 
-                {
+				    && t->buf[t->tail - 1] == '\n') {
 					t->buf[t->tail] = '\0';
+					//message("pos: %i\n",pos);
                     return split_pos;
 				}
 			}
-
+        
 		// If not, read more data.  Note that the read will not block
 		// unless NO data is available.
-		int ret = read_to_taskbuf(t->peer_fd, t);//push data from fd to t->buf
+		int ret = read_to_taskbuf(t->peer_fd, t);
 		if (ret == TBUF_ERROR)
 			die("tracker read error");
 		else if (ret == TBUF_END)
-        {
-            t->additionalBufferSpace+=23000;
-            t->buf = (char*)realloc(t->buf, (23000)*sizeof(char));
-            //if (t->buf == NULL) message("OH!");
-            //message("size = %i\n", TASKBUFSIZ+t->additionalBufferSpace);
-            //die("tracker connection closed prematurely!\n");
-        }
+			die("tracker connection closed prematurely!\n");
 	}
 }
 
@@ -746,9 +733,28 @@ static void task_upload(task_t *t)
 	}
 	t->head = t->tail = 0;
     
-    
-    
     //Make SURE can't open file in another directory!
+	char requested_dir[PATH_MAX];
+	char current_working_dir[PATH_MAX];
+	
+	if (!realpath(t->filename, requested_dir))
+	{
+		error("Unable to resolve requested file: %s", strerror(errno));
+		goto exit;
+	}
+	
+	if (!getcwd(current_working_dir, PATH_MAX))
+	{
+		error("Failed to find current working directory: %s", strerror(errno));
+		goto exit;
+	}
+	
+	if (!strcmp(requested_dir, current_working_dir))
+	{
+		error("Peer requesting a file not in the current directory!");
+		goto exit;
+	}
+	
 	t->disk_fd = open(t->filename, O_RDONLY);
 	if (t->disk_fd == -1) {
 		error("* Cannot open file %s", t->filename);
