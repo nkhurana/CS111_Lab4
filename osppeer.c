@@ -38,6 +38,8 @@ static int listen_port;
 
 #define TASKBUFSIZ	4096	// Size of task_t::buf
 #define FILENAMESIZ	256	// Size of task_t::filename
+#define MAXFILESIZE 2147483648 //2 GB MAX
+
 
 typedef enum tasktype {		// Which type of connection is this?
 	TASK_TRACKER,		// => Tracker connection
@@ -185,9 +187,12 @@ taskbufresult_t read_to_taskbuf(int fd, task_t *t)
 		return TBUF_END;
 	else {
 		t->tail += amt;
+        //message("tail here: %i\n", t->tail);
 		return TBUF_OK;
 	}
 }
+
+
 
 
 // write_from_taskbuf(fd, t)
@@ -299,7 +304,9 @@ static size_t read_tracker_response(task_t *t)
 	while (1) 
     {
 		// Check for whether buffer is complete.
-		for (; pos+3 < t->tail; pos++)
+		//message("and tail: %i\n", t->tail);
+        //message("pos: %i\n", pos);
+        for (; pos+3 < t->tail; pos++)
 			if ((pos == 0 || t->buf[pos-1] == '\n')
 			    && isdigit((unsigned char) t->buf[pos])
 			    && isdigit((unsigned char) t->buf[pos+1])
@@ -307,6 +314,8 @@ static size_t read_tracker_response(task_t *t)
             {
 				if (split_pos == (size_t) -1)
 					split_pos = pos;
+                //if (t->tail>8000)
+                    //message("tail: %i\n", t->tail);
 				if (pos + 4 >= t->tail)
 					break;
 				if (isspace((unsigned char) t->buf[pos + 3])
@@ -324,8 +333,10 @@ static size_t read_tracker_response(task_t *t)
 			die("tracker read error");
 		else if (ret == TBUF_END)
         {
-            t->additionalBufferSpace+=TASKBUFSIZ;
-            t->buf = (char*)realloc(t->buf, (TASKBUFSIZ+t->additionalBufferSpace)*sizeof(char));
+            t->additionalBufferSpace+=23000;
+            t->buf = (char*)realloc(t->buf, (23000)*sizeof(char));
+            //if (t->buf == NULL) message("OH!");
+            //message("size = %i\n", TASKBUFSIZ+t->additionalBufferSpace);
             //die("tracker connection closed prematurely!\n");
         }
 	}
@@ -499,8 +510,11 @@ task_t *start_download(task_t *tracker_task, const char *filename)
 		goto exit;
 	}
 	
-    //BUFFER OVERFLOW
-    strcpy(t->filename, filename);
+    //BUFFER OVERFLOW FIX
+    strncpy(t->filename,filename, FILENAMESIZ);
+    t->filename[FILENAMESIZ-1] = '\0';
+    //strcpy(t->filename, filename);
+
 
 	// add peers
 	s1 = tracker_task->buf;
@@ -593,19 +607,34 @@ static void task_download(task_t *t, task_t *tracker_task)
 		return;
 	}
 
+    
+    //ADD CODE TO CHECK HOW MUCH IS DOWNLOADED
+    
 	// Read the file into the task buffer from the peer,
 	// and write it from the task buffer onto disk.
-	while (1) {
+	while (1) 
+    {
 		int ret = read_to_taskbuf(t->peer_fd, t);
-		if (ret == TBUF_ERROR) {
+		if (ret == TBUF_ERROR) 
+        {
 			error("* Peer read error");
 			goto try_again;
-		} else if (ret == TBUF_END && t->head == t->tail)
+		} 
+        else if (ret == TBUF_END && t->head == t->tail)
 			/* End of file */
 			break;
         
         //write from task buffer onto disk file that you downloaded
 		ret = write_from_taskbuf(t->disk_fd, t);
+        
+        //if over 2 GB then remove file!
+        if (t->total_written > MAXFILESIZE)
+        {
+            remove(t->filename);
+            task_free(t);
+            return;
+        }
+        
         
 		if (ret == TBUF_ERROR) {
 			error("* Disk write error");
@@ -614,7 +643,8 @@ static void task_download(task_t *t, task_t *tracker_task)
 	}
 
 	// Empty files are usually a symptom of some error.
-	if (t->total_written > 0) {
+	if (t->total_written > 0) 
+    {
 		message("* Downloaded '%s' was %lu bytes long\n",
 			t->disk_filename, (unsigned long) t->total_written);
 		
@@ -704,6 +734,11 @@ static void task_upload(task_t *t)
     //TASKBUFSIZE can be 4096 but filenamesize is limited to 256
     //t->tail can be greater than 256 and you can go over your requested filename array
     
+    if (t->tail > FILENAMESIZ + 10) //10 for GET %s OSP2P
+    {
+        error("* Preventing buffer overflow attack! Requested file is too large!");
+        goto exit;
+    }
 	if (osp2p_snscanf(t->buf, t->tail, "GET %s OSP2P\n", t->filename) < 0) 
     {
 		error("* Odd request %.*s\n", t->tail, t->buf);
