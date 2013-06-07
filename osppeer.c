@@ -28,6 +28,11 @@ int evil_mode;			// nonzero iff this peer should behave badly
 
 static struct in_addr listen_addr;	// Define listening endpoint
 static int listen_port;
+#define MAXFILESIZE 1048576 //1 MB MAX
+#define MINIMUM_BYTES_TRANSMITTED 16 //peer must send more than 16 bytes at a time
+#define MAX_TIMES_BELOW_ACCEPTABLE_RATE 4
+
+#define ATTACK_FILE_LENGTH 10240 //length of attack file is 10 KB
 
 
 /*****************************************************************************
@@ -36,9 +41,9 @@ static int listen_port;
  * a bounded buffer that simplifies reading from and writing to peers.
  */
 
-#define TASKBUFSIZ	4096	// Size of task_t::buf
+//increased size from 2^12 to 2^14 to accomomdate larger messages
+#define TASKBUFSIZ	16384	// Size of task_t::buf
 #define FILENAMESIZ	256	// Size of task_t::filename
-#define MAXFILESIZE 2147483648 //2 GB MAX
 
 
 typedef enum tasktype {		// Which type of connection is this?
@@ -61,10 +66,7 @@ typedef struct task {
 	int peer_fd;		// File descriptor to peer/tracker, or -1
 	int disk_fd;		// File descriptor to local file, or -1
 
-	//char buf[TASKBUFSIZ];	// Bounded buffer abstraction
-    char *buf;
-    //used to fix popular tracker error (allows the transmission on longer messages)
-    size_t additionalBufferSpace;
+	char buf[TASKBUFSIZ];	// Bounded buffer abstraction
 	unsigned head;
 	unsigned tail;
 	size_t total_written;	// Total number of bytes written
@@ -97,9 +99,6 @@ static task_t *task_new(tasktype_t type)
 	t->head = t->tail = 0;
 	t->total_written = 0;
 	t->peer_list = NULL;
-    //create buf array of 4096 bytes
-    t->buf = (char*) malloc(sizeof(char)*TASKBUFSIZ);
-    t->additionalBufferSpace=0;
 
 	strcpy(t->filename, "");
 	strcpy(t->disk_filename, "");
@@ -141,7 +140,6 @@ static void task_free(task_t *t)
 		do {
 			task_pop_peer(t);
 		} while (t->peer_list);
-        free(t->buf);
 		free(t);
 	}
 }
@@ -172,14 +170,14 @@ taskbufresult_t read_to_taskbuf(int fd, task_t *t)
 	unsigned headpos = (t->head % TASKBUFSIZ);
 	unsigned tailpos = (t->tail % TASKBUFSIZ);
 	ssize_t amt;
-    
+
 	if (t->head == t->tail || headpos < tailpos)
 		amt = read(fd, &t->buf[tailpos], TASKBUFSIZ - tailpos);
 	else
 		amt = read(fd, &t->buf[tailpos], headpos - tailpos);
-    
+
 	if (amt == -1 && (errno == EINTR || errno == EAGAIN
-                      || errno == EWOULDBLOCK))
+			  || errno == EWOULDBLOCK))
 		return TBUF_AGAIN;
 	else if (amt == -1)
 		return TBUF_ERROR;
@@ -190,8 +188,6 @@ taskbufresult_t read_to_taskbuf(int fd, task_t *t)
 		return TBUF_OK;
 	}
 }
-
-
 
 
 // write_from_taskbuf(fd, t)
@@ -299,7 +295,7 @@ static size_t read_tracker_response(task_t *t)
 	char *s;
 	size_t split_pos = (size_t) -1, pos = 0;
 	t->head = t->tail = 0;
-    
+
 	while (1) {
 		// Check for whether buffer is complete.
 		for (; pos+3 < t->tail; pos++)
@@ -314,11 +310,10 @@ static size_t read_tracker_response(task_t *t)
 				if (isspace((unsigned char) t->buf[pos + 3])
 				    && t->buf[t->tail - 1] == '\n') {
 					t->buf[t->tail] = '\0';
-					//message("pos: %i\n",pos);
-                    return split_pos;
+					return split_pos;
 				}
 			}
-        
+
 		// If not, read more data.  Note that the read will not block
 		// unless NO data is available.
 		int ret = read_to_taskbuf(t->peer_fd, t);
@@ -409,7 +404,7 @@ static void register_files(task_t *tracker_task, const char *myalias)
 
 	// Register address with the tracker.
 	osp2p_writef(tracker_task->peer_fd, "ADDR %s %I:%d\n",
-		     myalias, listen_addr, listen_port);//write to fd the msg
+		     myalias, listen_addr, listen_port);
 	messagepos = read_tracker_response(tracker_task);
 	message("* Tracker's response to our IP address registration:\n%s",
 		&tracker_task->buf[messagepos]);
@@ -422,8 +417,7 @@ static void register_files(task_t *tracker_task, const char *myalias)
 	message("* Registering our files with tracker\n");
 	if ((dir = opendir(".")) == NULL)
 		die("open directory: %s", strerror(errno));
-	while ((ent = readdir(dir)) != NULL) 
-    {
+	while ((ent = readdir(dir)) != NULL) {
 		int namelen = strlen(ent->d_name);
 
 		// don't depend on unreliable parts of the dirent structure
@@ -477,16 +471,10 @@ task_t *start_download(task_t *tracker_task, const char *filename)
 	assert(tracker_task->type == TASK_TRACKER);
 
 	message("* Finding peers for '%s'\n", filename);
-    
-    
-    //NEXT TWO LINES are affecting popular tracker!
-    
-     //write to tracker that you WANT FILENAME
-    //yet what if many peers have file and tracker attempts to send them all!
+
 	osp2p_writef(tracker_task->peer_fd, "WANT %s\n", filename);
 	messagepos = read_tracker_response(tracker_task);
-	if (tracker_task->buf[messagepos] != '2') 
-    {
+	if (tracker_task->buf[messagepos] != '2') {
 		error("* Tracker error message while requesting '%s':\n%s",
 		      filename, &tracker_task->buf[messagepos]);
 		goto exit;
@@ -497,19 +485,22 @@ task_t *start_download(task_t *tracker_task, const char *filename)
 		goto exit;
 	}
 	
-    //BUFFER OVERFLOW FIX
-    strncpy(t->filename,filename, FILENAMESIZ);
+    
+    //buffer overflow fix
+    
+    //if filename is valid size, t->filename will be appropriately null terminated
+    //if filename is a huge string and it was indeed a buffer overflow attack then
+    //it will cut off after 256 bytes (FILENAMESIZ)
+    strncpy(t->filename, filename, FILENAMESIZ);
     t->filename[FILENAMESIZ-1] = '\0';
+    
+    
     //strcpy(t->filename, filename);
-
 
 	// add peers
 	s1 = tracker_task->buf;
-    
-    //CREATE peer_list
-	while ((s2 = memchr(s1, '\n', (tracker_task->buf + messagepos) - s1))) 
-    {
-		if (!(p = parse_peer(s1, s2 - s1))) //PARSES peer_t p
+	while ((s2 = memchr(s1, '\n', (tracker_task->buf + messagepos) - s1))) {
+		if (!(p = parse_peer(s1, s2 - s1)))
 			die("osptracker responded to WANT command with unexpected format!\n");
 		p->next = t->peer_list;
 		t->peer_list = p;
@@ -535,14 +526,12 @@ static void task_download(task_t *t, task_t *tracker_task)
 	       && tracker_task->type == TASK_TRACKER);
 
 	// Quit if no peers, and skip this peer
-	if (!t || !t->peer_list) 
-    {
+	if (!t || !t->peer_list) {
 		error("* No peers are willing to serve '%s'\n",
 		      (t ? t->filename : "that file"));
 		task_free(t);
 		return;
-	} 
-    else if (t->peer_list->addr.s_addr == listen_addr.s_addr
+	} else if (t->peer_list->addr.s_addr == listen_addr.s_addr
 		   && t->peer_list->port == listen_port)
 		goto try_again;
 
@@ -550,58 +539,61 @@ static void task_download(task_t *t, task_t *tracker_task)
 	message("* Connecting to %s:%d to download '%s'\n",
 		inet_ntoa(t->peer_list->addr), t->peer_list->port,
 		t->filename);
-    
-    //change peer_fd to peer socket that you are downloading from
-	t->peer_fd = open_socket(t->peer_list->addr, t->peer_list->port); 
-	if (t->peer_fd == -1) {
+	t->peer_fd = open_socket(t->peer_list->addr, t->peer_list->port);
+	if (t->peer_fd == -1) 
+    {
 		error("* Cannot connect to peer: %s\n", strerror(errno));
 		goto try_again;
 	}
-	osp2p_writef(t->peer_fd, "GET %s OSP2P\n", t->filename);//send "GET FILENAME" RPC to peer
+	
+    
+    
+    //ATTACK OUR PEER by sending a huge filename and cause buffer overflow
+    if (evil_mode)
+    {
+        char hugeFileName[ATTACK_FILE_LENGTH];
+        memset(hugeFileName, 'a', ATTACK_FILE_LENGTH);
+        hugeFileName[ATTACK_FILE_LENGTH-1] = '\0';
+        osp2p_writef(t->peer_fd, "GET %s OSP2P\n", hugeFileName);
+        
+    }
+    else osp2p_writef(t->peer_fd, "GET %s OSP2P\n", t->filename);
 
 	// Open disk file for the result.
 	// If the filename already exists, save the file in a name like
 	// "foo.txt~1~".  However, if there are 50 local files, don't download
 	// at all.
-	for (i = 0; i < 50; i++) 
-    {
+	for (i = 0; i < 50; i++) {
 		if (i == 0)
 			strcpy(t->disk_filename, t->filename);
 		else
 			sprintf(t->disk_filename, "%s~%d~", t->filename, i);
-		//open and create file!
-        //disk->fd contains file descriptor for downloaded file
-        t->disk_fd = open(t->disk_filename,
+		t->disk_fd = open(t->disk_filename,
 				  O_WRONLY | O_CREAT | O_EXCL, 0666);
-		
-        //error checking w opening file
-        if (t->disk_fd == -1 && errno != EEXIST) 
-        {
+		if (t->disk_fd == -1 && errno != EEXIST) {
 			error("* Cannot open local file");
 			goto try_again;
-		} 
-        else if (t->disk_fd != -1) 
-        {
+		} else if (t->disk_fd != -1) {
 			message("* Saving result to '%s'\n", t->disk_filename);
 			break;
 		}
 	}
-	if (t->disk_fd == -1) 
-    {
+	if (t->disk_fd == -1) {
 		error("* Too many local files like '%s' exist already.\n\
 * Try 'rm %s.~*~' to remove them.\n", t->filename, t->filename);
 		task_free(t);
 		return;
 	}
+    
+    int num_times_belowAcceptableRate = 0;
 
-    
-    //ADD CODE TO CHECK HOW MUCH IS DOWNLOADED
-    
 	// Read the file into the task buffer from the peer,
 	// and write it from the task buffer onto disk.
 	while (1) 
     {
-		int ret = read_to_taskbuf(t->peer_fd, t);
+		//read data from peer fd into task buffer
+        int ret = read_to_taskbuf(t->peer_fd, t);
+        //message("tail: %i\n",t->tail);
 		if (ret == TBUF_ERROR) 
         {
 			error("* Peer read error");
@@ -610,32 +602,47 @@ static void task_download(task_t *t, task_t *tracker_task)
         else if (ret == TBUF_END && t->head == t->tail)
 			/* End of file */
 			break;
+       
+        //write from task buffer to disk
+		//message("head: %i\n",t->head);
         
-        //write from task buffer onto disk file that you downloaded
-		ret = write_from_taskbuf(t->disk_fd, t);
-        
-        //if over 2 GB then remove file!
-        if (t->total_written > MAXFILESIZE)
+        if ((t->tail - t->head) < MINIMUM_BYTES_TRANSMITTED)
         {
-            remove(t->filename);
-            task_free(t);
-            return;
+            num_times_belowAcceptableRate++;
+            if (num_times_belowAcceptableRate > MAX_TIMES_BELOW_ACCEPTABLE_RATE)
+            {
+                error("Peer is transmitted too slowly. Attempting to try another peer!");
+                goto try_again;
+                
+            }
         }
         
+        ret = write_from_taskbuf(t->disk_fd, t);
+        //message("head: %i\n",t->head);
         
-		if (ret == TBUF_ERROR) {
+		if (ret == TBUF_ERROR) 
+        {
 			error("* Disk write error");
 			goto try_again;
 		}
+        
+        //maximum size of 1GB for files or else try another peer!
+        //cut off peer from writing more
+        if (t->total_written > MAXFILESIZE)
+        {
+            error("Peer is sending too large of a file! Attempting to try another peer!");
+            goto try_again;
+        }
+        
+        
+        
 	}
 
 	// Empty files are usually a symptom of some error.
-	if (t->total_written > 0) 
-    {
+	if (t->total_written > 0) {
 		message("* Downloaded '%s' was %lu bytes long\n",
 			t->disk_filename, (unsigned long) t->total_written);
-		
-        // Inform the tracker that we now have the file,
+		// Inform the tracker that we now have the file,
 		// and can serve it to others!  (But ignore tracker errors.)
 		if (strcmp(t->filename, t->disk_filename) == 0) {
 			osp2p_writef(tracker_task->peer_fd, "HAVE %s\n",
@@ -683,7 +690,6 @@ static task_t *task_listen(task_t *listen_task)
 	return t;
 }
 
-
 // task_upload(t)
 //	Handles an upload request from another peer.
 //	First reads the request into the task buffer, then serves the peer
@@ -702,10 +708,10 @@ static void task_upload(task_t *t)
 			goto exit;
 		} 
         else if (ret == TBUF_END
-			   || (t->tail && t->buf[t->tail-1] == '\n'))
+                 || (t->tail && t->buf[t->tail-1] == '\n'))
 			break;
 	}
-
+    
 	assert(t->head == 0);
     
     //SOMETHING FISHY
@@ -734,35 +740,47 @@ static void task_upload(task_t *t)
 	t->head = t->tail = 0;
     
     //Make SURE can't open file in another directory!
-	char requested_dir[PATH_MAX];
+	char requested_filePath[PATH_MAX];
 	char current_working_dir[PATH_MAX];
 	
-	if (!realpath(t->filename, requested_dir))
+	if (!realpath(t->filename, requested_filePath))
 	{
-		error("Unable to resolve requested file: %s", strerror(errno));
+		error("Unable to resolve requested file!");
 		goto exit;
 	}
 	
 	if (!getcwd(current_working_dir, PATH_MAX))
 	{
-		error("Failed to find current working directory: %s", strerror(errno));
+		error("Failed to find current working directory!");
 		goto exit;
 	}
 	
-	if (!strcmp(requested_dir, current_working_dir))
+    //compare path up to requested file name which isn't included by cwd
+	if (strncmp(requested_filePath, current_working_dir, strlen(current_working_dir)))
 	{
 		error("Peer requesting a file not in the current directory!");
 		goto exit;
 	}
+    
+    //ATTACK by sending huge amount of data to fill peer's dis
+    if (evil_mode)
+    {
+        message("* Transferring file %s\n", t->filename);
+        while (1) 
+            //continually write garbage to peer and fill up this disk!
+            osp2p_writef(t->peer_fd, "Garbage Data");
+    }
 	
 	t->disk_fd = open(t->filename, O_RDONLY);
 	if (t->disk_fd == -1) {
 		error("* Cannot open file %s", t->filename);
 		goto exit;
 	}
-
+    
 	message("* Transferring file %s\n", t->filename);
 	// Now, read file from disk and write it to the requesting peer.
+    
+    
 	while (1) 
     {
 		//writes from bounded buffer that should have the file contents into peer's fd socket
@@ -781,16 +799,15 @@ static void task_upload(task_t *t)
 			goto exit;
 		} 
         else if (ret == TBUF_END && t->head == t->tail)
-			/* End of file */
+        /* End of file */
 			break;
 	}
-
+    
 	message("* Upload of %s complete\n", t->filename);
-
-    exit:
+    
+exit:
 	task_free(t);
 }
-
 
 // main(argc, argv)
 //	The main loop!
@@ -870,47 +887,51 @@ int main(int argc, char *argv[])
 	listen_task = start_listen();
 	register_files(tracker_task, myalias);
 
+    
+    
+     //Add parallelism with forking
+     //interleave uploading and downloading
+     
+     pid_t pid;
+     // First, download files named on command line.
+     for (; argc > 1; argc--, argv++)
+     {
+         if ((t = start_download(tracker_task, argv[1])))
+         {
+             if ((pid=fork())==0) //child process
+             {
+                 task_download(t, tracker_task);
+                 exit(0); //child process exits
+             }
+             if (pid<0)
+                 error("Couldn't fork! Downloads may not be parallelized!");
+         }
+     }
+     
+     
+     // Then accept connections from other peers and upload files to them!
+     while ((t = task_listen(listen_task)))
+     {
+         if ((pid=fork())==0) //child process
+         {
+             task_upload(t);
+             exit(0);
+         }
+         if (pid<0)
+             error("Couldn't fork! Uploads may not be parallelized!");
+     }
+     
+     
+    
     /*
-    //Add parallelism with forking
-    //interleave uploading and downloading
-    
-    pid_t pid;
 	// First, download files named on command line.
-	for (; argc > 1; argc--, argv++)
-    {
-        sleep(1);
-        if ((pid=fork())==0) //child process
-        {
-            if ((t = start_download(tracker_task, argv[1])))
-                task_download(t, tracker_task);
-            exit(0); //child process exits
-        }
-    }
-    
-    //wait for all children before moving on
-    int status;
-    while (waitpid(-1, &status, 0)!=-1){}
-
-	// Then accept connections from other peers and upload files to them!
-	while ((t = task_listen(listen_task)))
-    {
-		//if ((pid=fork())==0) //child process
-        //{
-            task_upload(t);
-          //  exit(0);
-        //}
-    }
-    
-    */
-    
-    // First, download files named on command line.
 	for (; argc > 1; argc--, argv++)
 		if ((t = start_download(tracker_task, argv[1])))
 			task_download(t, tracker_task);
-    
+
 	// Then accept connections from other peers and upload files to them!
 	while ((t = task_listen(listen_task)))
-		task_upload(t);
+		task_upload(t);*/
 
 	return 0;
 }

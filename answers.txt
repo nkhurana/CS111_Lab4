@@ -2,6 +2,7 @@
 # If you are working in a team, fill out the information for both team 
 # members.
 
+
 # SUBMIT THE LAB ONLY ONCE (from only one partner). This file will be
 # automatically parsed in order to give both team members credit for the
 # lab.
@@ -13,13 +14,13 @@
 # information you'd like us to know, please add it at the end of the file.
 
 # Partner 1
-Name: 
-Student ID: 
-Email: 
+Name: Neeraj Khurana
+Student ID: 603795975	
+Email: nickykhurana@gmail.com
 
 # Partner 2 (if you're working in a team)
-Name: 
-Student ID: 
+Name: Evan Shi
+Student ID: 103802860
 Email: 
 
 # EXERCISE 1: What method you used to make your peer download and upload
@@ -28,11 +29,37 @@ Email:
 # EXERCISE 2A: What conditions did you find and fix that would have
 #    triggered a buffer overrun bug?  (~1-3 sentences each)
 
+There were two buffer overflow attacks that comprised our peer's code and opened it to buffer overflow attacks. The first buffer overflow attack would be initiated from our peer itself. If we requested our peer to download a file whose name was greater than FILENAMESIZ (256) characters, we would overwrite the task's filename character buffer. The strcpy function was used to copy character bytes from the requested file name into our task's filename character buffer. Buffer overflow will occur if the source character string is larger than the size of the array pointed by destination (in this case t->filename). To fix this error, we used the strncpy function to copy the character string representing the filename. This function allows the user to specify the maximum number of characters to copy. Since our filename array in our task struct is limited to FILENAMESIZ (256 bytes), we ensured that only a maximum of FILENAMESIZ bytes would be copied. If the filename was indeed under the 256 maximum length, strncpy would work exactly as strcpy would as it would just pad the remainder of the destination array with NULL bytes.
+
+The second and more likely type of buffer overflow attack can be initiated from a malicious peer. In this case, another peer can request to upload a file from our peer with a name greater than FILENAMESIZ. The skeleton code copies the filename from task buf that currently holds the message "GET [INSERT REQUESTED FILENAME] OSP2P\n into our filename character array using osp2p_snscanf. This function takes the number of number of characters to copy over as a parameter len. An issue occurs because the skeleton code allows the but to hold TASKBUFSIZ bytes which is much greater than FILENAMSIZ. Therefore, in the case where a malicious peer requests a file whose name is greater than FILENAMSIZ bytes, they can cause buffer overflow. To fix this, I added a simple check to ensure the message to upload a file from another peer isn't greater than FILENAMSIZE + 10, or else the code will throw an error and not complete the UPLOAD_TASK. The 10 is for the characters that include GET (SPACE) OSP2P; in other words, the upload message sent by the peer can be a maximum of 266 character bytes because only the filename is copied even though there is more to the message.
+
+
+
 # EXERCISE 2B: What other robustness problems did you fix?  (~1-3 sentences
 #    each)
 
+
+We ensured that another peer couldn't download a file outside the current directory; in others words, we protected against the possibility of sharing files outside the current directory. A malicious peer could send the tracker a request for a file in our current directory and may solicit our peer for that file. However, when requesting a certain file, a malicious peer can encode a different pathname instead of a file in the current directory, and the given skeleton code would blindly serve that file. Thus, to protect against sharing other files, we used the getcwd() and realpath() function to resolve the path of the requested file and ensure it is indeed within the current working directory using strncmp. 
+
+We also made sure our peer wouldn't download a huge file from a malicious peer and eventually run out of disk space. We limited our files to be a maximum of 1 MB; if our peer is downloading a file greater than 1 MB, we removed that file and attempted to connect to another peer to serve the file.
+
+We also made sure our peer wasn't downloading from a peer who was uploading the file extremely slowly. We limited the peer's transmission speed to be 16 bytes. If a peer uploaded a file less than 16 bytes at a time continuously, we disconnected from that peer and attempted to connect to another peer to serve that file.
+
+Another robustness fix was mentioned in the buffer overflow attacks; we made sure that a malicious peer couldn't attempt to gain control of our computer by sending a huge filename that would overflow our character array buffer.
+
+
+Another problem occurred when connecting to the popular tracker. This tracker was popular in the sense that it had many registered peers and a mapping of registered peers to registered files. Thus, when attempting to ask this popular tracker for all the peers that had a certain file, a "tracker connection closed prematurely" error was thrown. This was because the popular tracker had so many registered peers that its message dictating all available peers willing to serve the file was bigger than TASKBUFSIZ (4096) bytes. To fix this, our code increased the TASKBUFSIZ to 2^14 to accommodate larger messages from trackers and peers at a time. Another solution would be to have the buf array within the task struct to be allocated from the heap upon initialization, and realloc more memory as needed to accommodate a longer message from the tracker (larger messages from peers would not be reallocated!). This would be a much cleaner solution because we would always be able to handle long requests. Yet, we decided against this because of the possibility of continually allocating heap space if a tracker sent an unreasonably large message, thus crashing our whole system. We designed our system believing the tracker is "good", however, we are still wary of fully trusting the tracker to defend our system!
+
+
+
 # EXERCISE 3: Describe the attacks you implemented for "evil mode".  Why
 #    are they attacks?  (~3-10 sentences each)
+
+We implemented two attacks on other peers if "evil mode" was set. First, our peer attempted a buffer overflow attack on other peers when attempting to download a file from them. After the tracker stated all the peers with a certain file that we requested, our peer would pick a peer and request a different file with a name 10 KB long. With this, our peer hoped to stomp all over our connected peer's memory; since we aren't sure how the other peers are implemented, we can only hope to overwrite their memory. With more knowledge of the other peer's code, we could have chosen a better file length to ensure buffer overflow or even possibly take over their machine.
+Our second attack was an attempt to fill up our peer's disk space. When a peer attempted to upload a file, our maliciously intentioned peer would write the string "Garbage Data" infinitely to fill the connected peer's disk instead of writing the contents of the requested file. Our intention was to monopolize the peer's resources!
+
+
+
 
 # Extra credit problems
 #Extra credit problem: none
