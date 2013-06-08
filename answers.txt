@@ -21,10 +21,12 @@ Email: nickykhurana@gmail.com
 # Partner 2 (if you're working in a team)
 Name: Evan Shi
 Student ID: 103802860
-Email: 
+Email: eshi@ucla.edu
 
 # EXERCISE 1: What method you used to make your peer download and upload
 #    files in parallel?  (~1-3 sentences)
+
+We used forking to process multiple downloads and uploads. We made each child process handle every upload and download case from a peer and had that child process exit when finished. The parent process would only set up the tracker task in start download and then fork a child to have that child interact with the corresponding peer to download ot upload a certain file. This greatly enhaned performance because we weren't busy waiting for another peer to upload/download a file from us. In other words, our overall performance wasn't affected by a slow peer; other work could be done. The kernel would take care of scheduling different children processes. We allowed downloads and uploads to happen in parallel.
 
 # EXERCISE 2A: What conditions did you find and fix that would have
 #    triggered a buffer overrun bug?  (~1-3 sentences each)
